@@ -1,0 +1,8 @@
+# 项目依赖包列表
+# 使用方法: pip install -r requirements.txt
+
+# 在这里添加你的项目依赖
+# 例如:
+# requests==2.31.0
+# numpy==1.24.3
+
