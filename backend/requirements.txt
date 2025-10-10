@@ -1,0 +1,15 @@
+# py-picToWork MVP 版本依赖
+
+# Web 框架
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# 图像识别和处理
+opencv-python>=4.8.0
+numpy>=1.26.0
+Pillow>=10.1.0
+mss>=9.0.0
+
+# 自动化控制
+pyautogui>=0.9.54

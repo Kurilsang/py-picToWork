@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+py-picToWork 后端服务示例
+FastAPI 应用入口
+
+将此文件复制到 backend/main.py 并根据需要修改
+"""
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional
+import uvicorn
+import asyncio
+from datetime import datetime
+
+# 创建 FastAPI 应用
+app = FastAPI(
+    title="py-picToWork API",
+    description="基于图像识别的屏幕自动化操作工具 API",
+    version="1.0.0"
+)
+
+# 配置 CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 生产环境应该限制具体域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 数据模型
+class Workflow(BaseModel):
+    id: Optional[str] = None
+    name: str
+    description: str
+    nodes: List[dict]
+    connections: List[dict]
+    variables: Optional[dict] = None
+
+class ExecutionRequest(BaseModel):
+    workflow_id: str
+    options: Optional[dict] = None
+
+class ImageUpload(BaseModel):
+    name: str
+    category: Optional[str] = "default"
+
+# 模拟数据存储
+workflows_db = {}
+images_db = {}
+executions_db = {}
+
+# WebSocket 连接管理
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def send_message(self, message: dict, websocket: WebSocket):
+        await websocket.send_json(message)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            await connection.send_json(message)
+
+manager = ConnectionManager()
+
+# 路由定义
+
+@app.get("/")
+async def root():
+    """根路径"""
+    return {
+        "message": "py-picToWork API",
+        "version": "1.0.0",
+        "docs": "/docs"
+    }
+
+@app.get("/health")
+async def health_check():
+    """健康检查"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }
+
+# 工作流 API
+
+@app.post("/api/workflow/create")
+async def create_workflow(workflow: Workflow):
+    """创建工作流"""
+    import uuid
+    workflow.id = str(uuid.uuid4())
+    workflows_db[workflow.id] = workflow.dict()
+    return {
+        "id": workflow.id,
+        "name": workflow.name,
+        "created_at": datetime.now().isoformat()
+    }
+
+@app.get("/api/workflow/list")
+async def list_workflows():
+    """获取工作流列表"""
+    workflows = [
+        {
+            "id": wf_id,
+            "name": wf["name"],
+            "description": wf["description"],
+            "created_at": datetime.now().isoformat()
+        }
+        for wf_id, wf in workflows_db.items()
+    ]
+    return {"workflows": workflows}
+
+@app.get("/api/workflow/{workflow_id}")
+async def get_workflow(workflow_id: str):
+    """获取工作流详情"""
+    if workflow_id not in workflows_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Workflow not found"}
+        )
+    return workflows_db[workflow_id]
+
+@app.put("/api/workflow/{workflow_id}")
+async def update_workflow(workflow_id: str, workflow: Workflow):
+    """更新工作流"""
+    if workflow_id not in workflows_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Workflow not found"}
+        )
+    workflow.id = workflow_id
+    workflows_db[workflow_id] = workflow.dict()
+    return {
+        "id": workflow_id,
+        "message": "Workflow updated successfully"
+    }
+
+@app.delete("/api/workflow/{workflow_id}")
+async def delete_workflow(workflow_id: str):
+    """删除工作流"""
+    if workflow_id not in workflows_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Workflow not found"}
+        )
+    del workflows_db[workflow_id]
+    return {"message": "Workflow deleted successfully"}
+
+# 图片管理 API
+
+@app.post("/api/image/upload")
+async def upload_image(file: UploadFile = File(...), name: str = "", category: str = "default"):
+    """上传图片"""
+    import uuid
+    image_id = str(uuid.uuid4())
+    
+    # 这里应该保存文件到磁盘
+    # 示例代码：
+    # file_path = f"data/images/{image_id}.png"
+    # with open(file_path, "wb") as f:
+    #     f.write(await file.read())
+    
+    images_db[image_id] = {
+        "id": image_id,
+        "name": name or file.filename,
+        "category": category,
+        "filename": file.filename,
+        "size": 0,  # 实际应该是文件大小
+        "created_at": datetime.now().isoformat()
+    }
+    
+    return images_db[image_id]
+
+@app.get("/api/image/list")
+async def list_images(category: Optional[str] = None):
+    """获取图片列表"""
+    images = list(images_db.values())
+    if category:
+        images = [img for img in images if img["category"] == category]
+    return {"images": images}
+
+@app.delete("/api/image/{image_id}")
+async def delete_image(image_id: str):
+    """删除图片"""
+    if image_id not in images_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Image not found"}
+        )
+    del images_db[image_id]
+    return {"message": "Image deleted successfully"}
+
+# 执行控制 API
+
+@app.post("/api/execution/start")
+async def start_execution(request: ExecutionRequest):
+    """开始执行工作流"""
+    import uuid
+    
+    if request.workflow_id not in workflows_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Workflow not found"}
+        )
+    
+    execution_id = str(uuid.uuid4())
+    executions_db[execution_id] = {
+        "id": execution_id,
+        "workflow_id": request.workflow_id,
+        "status": "running",
+        "started_at": datetime.now().isoformat(),
+        "progress": 0
+    }
+    
+    # 这里应该启动实际的执行逻辑
+    # 示例：asyncio.create_task(execute_workflow(execution_id, request.workflow_id))
+    
+    return executions_db[execution_id]
+
+@app.post("/api/execution/pause")
+async def pause_execution(execution_id: str):
+    """暂停执行"""
+    if execution_id not in executions_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Execution not found"}
+        )
+    
+    executions_db[execution_id]["status"] = "paused"
+    return {"message": "Execution paused"}
+
+@app.post("/api/execution/resume")
+async def resume_execution(execution_id: str):
+    """继续执行"""
+    if execution_id not in executions_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Execution not found"}
+        )
+    
+    executions_db[execution_id]["status"] = "running"
+    return {"message": "Execution resumed"}
+
+@app.post("/api/execution/stop")
+async def stop_execution(execution_id: str):
+    """停止执行"""
+    if execution_id not in executions_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Execution not found"}
+        )
+    
+    executions_db[execution_id]["status"] = "stopped"
+    return {"message": "Execution stopped"}
+
+@app.get("/api/execution/status/{execution_id}")
+async def get_execution_status(execution_id: str):
+    """获取执行状态"""
+    if execution_id not in executions_db:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Execution not found"}
+        )
+    
+    return executions_db[execution_id]
+
+# 屏幕操作 API
+
+@app.post("/api/screen/capture")
+async def capture_screen(region: Optional[dict] = None):
+    """屏幕截图"""
+    # 这里应该实现实际的截图逻辑
+    # 使用 mss 或 pyautogui
+    
+    return {
+        "image": "base64_encoded_image_here",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/api/screen/find-image")
+async def find_image(image_id: str, confidence: float = 0.8):
+    """查找图片位置"""
+    # 这里应该实现实际的图像识别逻辑
+    # 使用 OpenCV 的模板匹配
+    
+    return {
+        "found": True,
+        "location": {
+            "x": 500,
+            "y": 300,
+            "width": 100,
+            "height": 50
+        },
+        "confidence": 0.92
+    }
+
+# WebSocket 端点
+
+@app.websocket("/ws/execution")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket 连接用于实时通信"""
+    await manager.connect(websocket)
+    
+    try:
+        while True:
+            # 接收客户端消息
+            data = await websocket.receive_json()
+            
+            # 处理不同类型的消息
+            if data.get("type") == "ping":
+                await manager.send_message({
+                    "type": "pong",
+                    "timestamp": datetime.now().timestamp()
+                }, websocket)
+            
+            elif data.get("type") == "start":
+                # 启动工作流执行
+                workflow_id = data.get("workflow_id")
+                # 这里应该启动实际执行
+                
+                # 发送开始消息
+                await manager.send_message({
+                    "type": "log",
+                    "timestamp": datetime.now().timestamp(),
+                    "data": {
+                        "level": "info",
+                        "message": f"开始执行工作流: {workflow_id}"
+                    }
+                }, websocket)
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        print("WebSocket disconnected")
+
+# 启动服务器
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  py-picToWork 后端服务")
+    print("=" * 60)
+    print()
+    print("服务地址: http://localhost:8000")
+    print("API 文档: http://localhost:8000/docs")
+    print("ReDoc: http://localhost:8000/redoc")
+    print()
+    print("按 Ctrl+C 停止服务")
+    print("=" * 60)
+    print()
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )

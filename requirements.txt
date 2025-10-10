@@ -1,8 +1,39 @@
-# 项目依赖包列表
+# py-picToWork 后端依赖
 # 使用方法: pip install -r requirements.txt
 
-# 在这里添加你的项目依赖
-# 例如:
-# requests==2.31.0
-# numpy==1.24.3
+# Web 框架
+fastapi==0.104.1           # 现代 Python Web 框架
+uvicorn[standard]==0.24.0  # ASGI 服务器
+websockets==12.0           # WebSocket 支持
+python-multipart==0.0.6    # 文件上传支持
+
+# 图像识别和处理
+opencv-python==4.8.1.78    # 图像识别核心
+Pillow==10.1.0             # 图像处理
+numpy==1.24.3              # 数值计算
+mss==9.0.1                 # 高性能屏幕截图
+
+# 自动化控制
+pyautogui==0.9.54          # 屏幕自动化
+pynput==1.7.6              # 底层输入控制
+
+# 数据模型和验证
+pydantic==2.5.0            # 数据验证
+pydantic-settings==2.1.0   # 配置管理
+
+# 工具库
+python-dotenv==1.0.0       # 环境变量管理
+aiofiles==23.2.1           # 异步文件操作
+
+# 可选依赖（OCR 功能）
+# pytesseract==0.3.10      # OCR 文字识别（需要先安装 Tesseract）
+
+# 可选依赖（任务队列）
+# celery==5.3.4            # 分布式任务队列
+# redis==5.0.1             # Redis 客户端
+
+# 开发工具
+# pytest==7.4.3            # 测试框架
+# black==23.12.0           # 代码格式化
+# flake8==6.1.0            # 代码检查
 
