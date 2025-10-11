@@ -23,6 +23,9 @@ from datetime import datetime
 import os
 import platform
 
+# 导入图像匹配模块
+from image_matcher import find_image_on_screen_multi_monitor
+
 # PyAutoGUI 安全配置
 pyautogui.FAILSAFE = True  # 移动鼠标到角落可以紧急停止
 pyautogui.PAUSE = 0.1  # 每次操作后暂停 0.1 秒
@@ -75,58 +78,89 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-def capture_screenshot():
-    """截取屏幕"""
+def get_all_monitors():
+    """获取所有显示器信息"""
     with mss.mss() as sct:
-        monitor = sct.monitors[1]  # 主显示器
-        screenshot = sct.grab(monitor)
-        # 转换为 numpy 数组
-        img = np.array(screenshot)
-        # 转换 BGRA 到 BGR
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        return img
+        monitors = []
+        for i, monitor in enumerate(sct.monitors[1:], 1):  # 跳过第0个（全屏）
+            monitors.append({
+                "id": i,
+                "left": monitor["left"],
+                "top": monitor["top"],
+                "width": monitor["width"],
+                "height": monitor["height"],
+                "name": f"显示器 {i}"
+            })
+        return monitors
 
-def find_image_on_screen(template_path, confidence=0.8):
+def capture_screenshot(monitor_id=None):
     """
-    在屏幕上查找图片
-    返回: (found, location, match_confidence)
+    截取屏幕
+    monitor_id: None表示所有显示器，数字表示指定显示器
+    返回: 图片或图片列表
     """
-    # 截取屏幕
-    screenshot = capture_screenshot()
+    with mss.mss() as sct:
+        if monitor_id is None:
+            # 截取所有显示器
+            screenshots = []
+            for i, monitor in enumerate(sct.monitors[1:], 1):
+                screenshot = sct.grab(monitor)
+                img = np.array(screenshot)
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                screenshots.append({
+                    "monitor_id": i,
+                    "image": img,
+                    "offset_x": monitor["left"],
+                    "offset_y": monitor["top"],
+                    "width": monitor["width"],
+                    "height": monitor["height"]
+                })
+            return screenshots
+        else:
+            # 截取指定显示器
+            if monitor_id < 1 or monitor_id >= len(sct.monitors):
+                monitor_id = 1  # 默认主显示器
+            
+            monitor = sct.monitors[monitor_id]
+            screenshot = sct.grab(monitor)
+            img = np.array(screenshot)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            return [{
+                "monitor_id": monitor_id,
+                "image": img,
+                "offset_x": monitor["left"],
+                "offset_y": monitor["top"],
+                "width": monitor["width"],
+                "height": monitor["height"]
+            }]
+
+def find_image_on_screen(template_path, confidence=0.8, enable_debug=False, monitor_id=None):
+    """
+    图像识别包装函数 - 支持多尺度、多算法和多显示器匹配
+    monitor_id: None=搜索所有显示器, 数字=指定显示器
+    返回: (found, location, match_confidence, match_info)
+    """
+    # 截取屏幕（单个或所有显示器）
+    screenshots = capture_screenshot(monitor_id)
     
-    # 加载模板图片
-    template = cv2.imread(template_path)
-    if template is None:
-        return False, None, 0.0
-    
-    # 转换为灰度图（加速匹配）
-    screenshot_gray = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
-    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-    
-    # 模板匹配
-    result = cv2.matchTemplate(screenshot_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-    
-    # 获取模板尺寸
-    h, w = template_gray.shape
-    
-    if max_val >= confidence:
-        # 计算中心点坐标
-        center_x = max_loc[0] + w // 2
-        center_y = max_loc[1] + h // 2
-        
-        location = {
-            "x": int(center_x),
-            "y": int(center_y),
-            "width": int(w),
-            "height": int(h),
-            "top_left": {"x": int(max_loc[0]), "y": int(max_loc[1])},
-            "bottom_right": {"x": int(max_loc[0] + w), "y": int(max_loc[1] + h)}
+    # 调用新的图像匹配模块
+    return find_image_on_screen_multi_monitor(screenshots, template_path, confidence, enable_debug)
+
+@app.get("/api/monitors")
+async def get_monitors():
+    """获取所有显示器信息"""
+    try:
+        monitors = get_all_monitors()
+        return {
+            "success": True,
+            "monitors": monitors,
+            "count": len(monitors)
         }
-        
-        return True, location, float(max_val)
-    
-    return False, None, float(max_val)
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -625,44 +659,118 @@ async def execute_task(
             f.write(content)
         
         await manager.send_log(websocket, "info", f"📁 图片已保存: {file.filename}")
-        await manager.send_log(websocket, "info", f"🔍 开始识别屏幕 (置信度: {confidence})")
         
-        # 查找图片
-        found, location, match_confidence = find_image_on_screen(file_path, confidence)
+        # 获取显示器信息
+        monitors = get_all_monitors()
+        monitor_summary = ", ".join([f"显示器{m['id']}({m['width']}x{m['height']})" for m in monitors])
+        await manager.send_log(websocket, "info", f"🖥️ 检测到 {len(monitors)} 个显示器: {monitor_summary}")
+        
+        await manager.send_log(websocket, "info", f"🔍 开始识别屏幕 (置信度: {confidence})")
+        await manager.send_log(websocket, "info", "🔬 使用多算法和多尺度匹配...")
+        
+        # 查找图片（启用调试模式）
+        found, location, match_confidence, match_info = find_image_on_screen(file_path, confidence, enable_debug=True)
+        
+        # 输出详细的坐标信息用于调试
+        if found and location:
+            await manager.send_log(
+                websocket,
+                "info",
+                f"🔍 坐标详情: 绝对({location.get('x')}, {location.get('y')}), "
+                f"相对({location.get('local_x')}, {location.get('local_y')}), "
+                f"显示器偏移({location.get('top_left', {}).get('x', 0) - location.get('local_x', 0) + location.get('width', 0)//2}, "
+                f"{location.get('top_left', {}).get('y', 0) - location.get('local_y', 0) + location.get('height', 0)//2})"
+            )
+        
+        # 显示匹配详情
+        if match_info.get("methods_tried"):
+            methods_text = ", ".join([
+                f"{m['method']}: {m.get('confidence', 0):.2%}" 
+                for m in match_info["methods_tried"] 
+                if 'confidence' in m
+            ])
+            await manager.send_log(
+                websocket,
+                "info",
+                f"📊 尝试的算法: {methods_text}"
+            )
+        
+        if match_info.get("best_method"):
+            await manager.send_log(
+                websocket,
+                "info",
+                f"🎯 最佳匹配方法: {match_info['best_method']}"
+            )
         
         if found:
+            monitor_info = f"显示器 {location.get('monitor_id', 1)}" if location.get('monitor_id') else ""
             await manager.send_log(
                 websocket, 
                 "success", 
-                f"✅ 找到目标图片！匹配度: {match_confidence:.2%}",
-                location
+                f"✅ 找到目标图片！匹配度: {match_confidence:.2%} ({monitor_info})",
+                {
+                    "location": location,
+                    "template_size": match_info.get("template_size"),
+                    "method": match_info.get("best_method"),
+                    "monitor_id": location.get('monitor_id'),
+                    "monitor_name": location.get('monitor_name')
+                }
             )
+            
+            # 显示所有显示器的搜索结果
+            if match_info.get("monitor_results"):
+                monitors_summary = []
+                for mr in match_info["monitor_results"]:
+                    monitors_summary.append(
+                        f"显示器{mr['monitor_id']}: {mr['best_confidence']:.2%}"
+                    )
+                await manager.send_log(
+                    websocket,
+                    "info",
+                    f"📺 各显示器匹配度: {', '.join(monitors_summary)}"
+                )
             
             # 执行点击
             try:
                 x = location['x']
                 y = location['y']
                 
-                # 获取屏幕尺寸用于验证坐标
-                screen_width, screen_height = pyautogui.size()
+                # 获取所有显示器信息用于验证
+                monitors = get_all_monitors()
+                
+                # 计算所有显示器的总范围
+                all_monitors_info = []
+                for m in monitors:
+                    all_monitors_info.append(
+                        f"显示器{m['id']}[{m['left']},{m['top']}-{m['left']+m['width']},{m['top']+m['height']}]"
+                    )
                 
                 await manager.send_log(
                     websocket,
                     "info",
-                    f"📺 屏幕尺寸: {screen_width}x{screen_height}"
+                    f"📺 显示器范围: {', '.join(all_monitors_info)}"
                 )
                 
-                # 验证坐标是否在屏幕范围内
-                if not (0 <= x <= screen_width and 0 <= y <= screen_height):
+                # 验证坐标是否在任意显示器范围内
+                coordinate_valid = False
+                for m in monitors:
+                    if (m['left'] <= x <= m['left'] + m['width'] and 
+                        m['top'] <= y <= m['top'] + m['height']):
+                        coordinate_valid = True
+                        await manager.send_log(
+                            websocket,
+                            "info",
+                            f"✅ 坐标在显示器{m['id']}范围内"
+                        )
+                        break
+                
+                if not coordinate_valid:
                     await manager.send_log(
                         websocket,
-                        "error",
-                        f"❌ 坐标超出屏幕范围: ({x}, {y})"
+                        "warning",
+                        f"⚠️ 坐标({x}, {y})可能超出显示器范围，但仍会尝试点击"
                     )
-                    return {
-                        "success": False,
-                        "error": "Coordinates out of screen bounds"
-                    }
+                    # 不再直接返回错误，而是继续尝试点击
                 
                 await manager.send_log(
                     websocket,
