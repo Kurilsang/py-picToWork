@@ -3,11 +3,13 @@
 
 """
 py-picToWork 简化版后端
-实现图片识别和自动点击功能
+实现图片识别和自动点击功能 - 优化整合版
 """
 
+# ==============================
+# 导入模块
+# ==============================
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -16,53 +18,311 @@ import numpy as np
 import pyautogui
 import mss
 from PIL import Image
-from typing import List
+from typing import List, Dict, Optional, Tuple, Any
 import asyncio
 import json
 from datetime import datetime
 import os
 import platform
+from dataclasses import dataclass
+import warnings
 
-# 导入图像匹配模块
-from image_matcher import find_image_on_screen_multi_monitor
+# ==============================
+# 配置定义
+# ==============================
+@dataclass
+class AppConfig:
+    """应用配置类"""
+    # 服务配置
+    PORT: int = 8899
+    HOST: str = "0.0.0.0"
+    LOG_LEVEL: str = "info"
+    
+    # 路径配置
+    UPLOAD_DIR: str = "backend/uploads"
+    STATIC_DIR: str = "static"
+    
+    # 图像识别配置
+    DEFAULT_CONFIDENCE: float = 0.8
+    MIN_CONFIDENCE: float = 0.0
+    MAX_CONFIDENCE: float = 1.0
+    
+    # PyAutoGUI 配置
+    PYAUTOGUI_PAUSE: float = 0.1
+    PYAUTOGUI_FAILSAFE: bool = True
+    MOVE_DURATION: float = 0.5
+    CLICK_INTERVAL: float = 0.1
+    
+    # WebSocket 配置
+    WS_RECONNECT_DELAY: int = 5  # 重连延迟（秒）
 
-# PyAutoGUI 安全配置
-pyautogui.FAILSAFE = True  # 移动鼠标到角落可以紧急停止
-pyautogui.PAUSE = 0.1  # 每次操作后暂停 0.1 秒
+# 初始化配置实例
+app_config = AppConfig()
 
-# macOS 特殊配置 - 防止意外的系统行为
-if platform.system() == 'Darwin':  # macOS
-    # 禁用 PyAutoGUI 的某些自动行为，避免触发系统功能
-    import warnings
-    warnings.filterwarnings('ignore', category=DeprecationWarning)
+# 系统相关配置
+SYSTEM = platform.system()
+IS_MACOS = SYSTEM == "Darwin"
+IS_WINDOWS = SYSTEM == "Windows"
+IS_LINUX = SYSTEM == "Linux"
 
-# 创建 FastAPI 应用
-app = FastAPI(title="py-picToWork MVP")
+# ==============================
+# 工具函数
+# ==============================
+def ensure_dir(dir_path: str) -> None:
+    """确保目录存在，不存在则创建"""
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path, exist_ok=True)
 
-# 配置 CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def save_uploaded_file(file_content: bytes, file_ext: str = "png") -> str:
+    """保存上传的文件"""
+    ensure_dir(app_config.UPLOAD_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    file_name = f"target_{timestamp}.{file_ext}"
+    file_path = os.path.join(app_config.UPLOAD_DIR, file_name)
+    
+    with open(file_path, "wb") as f:
+        f.write(file_content)
+    
+    return file_path
 
+def get_all_monitors() -> List[Dict]:
+    """获取所有显示器信息"""
+    with mss() as sct:
+        monitors = []
+        for i, monitor in enumerate(sct.monitors[1:], 1):  # 跳过第0个（全屏）
+            monitors.append({
+                "id": i,
+                "left": monitor["left"],
+                "top": monitor["top"],
+                "width": monitor["width"],
+                "height": monitor["height"],
+                "name": f"显示器 {i}",
+                "bounds": (
+                    monitor["left"], 
+                    monitor["top"], 
+                    monitor["left"] + monitor["width"], 
+                    monitor["top"] + monitor["height"]
+                )
+            })
+        return monitors
+
+def capture_screenshot(monitor_id: Optional[int] = None) -> List[Dict]:
+    """
+    截取屏幕
+    :param monitor_id: None表示所有显示器，数字表示指定显示器
+    :return: 图片列表，包含图片数据和显示器信息
+    """
+    with mss() as sct:
+        screenshots = []
+        
+        if monitor_id is None:
+            # 截取所有显示器
+            target_monitors = sct.monitors[1:]
+        else:
+            # 截取指定显示器
+            if monitor_id < 1 or monitor_id >= len(sct.monitors):
+                monitor_id = 1  # 默认主显示器
+            target_monitors = [sct.monitors[monitor_id]]
+        
+        for i, monitor in enumerate(target_monitors, 1):
+            screenshot = sct.grab(monitor)
+            img = np.array(screenshot)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            
+            screenshots.append({
+                "monitor_id": i,
+                "image": img,
+                "offset_x": monitor["left"],
+                "offset_y": monitor["top"],
+                "width": monitor["width"],
+                "height": monitor["height"],
+                "monitor_info": monitor
+            })
+        
+        return screenshots
+
+def validate_coordinates(x: float, y: float, monitors: List[Dict]) -> Tuple[bool, Optional[Dict]]:
+    """验证坐标是否在显示器范围内"""
+    for monitor in monitors:
+        left, top, right, bottom = monitor["bounds"]
+        if left <= x <= right and top <= y <= bottom:
+            return True, monitor
+    return False, None
+
+def get_file_extension(filename: str) -> str:
+    """获取文件扩展名"""
+    return filename.split(".")[-1].lower() if "." in filename else "png"
+
+def validate_image_file(filename: str, content_type: str) -> bool:
+    """验证是否为合法的图片文件"""
+    allowed_extensions = {"png", "jpg", "jpeg", "bmp", "gif"}
+    allowed_content_types = {"image/png", "image/jpeg", "image/bmp", "image/gif"}
+    
+    file_ext = get_file_extension(filename)
+    return file_ext in allowed_extensions and content_type in allowed_content_types
+
+# ==============================
+# 图像匹配模块（内置实现）
+# ==============================
+def find_image_on_screen_multi_monitor(
+    screenshots: List[Dict],
+    template_path: str,
+    confidence: float = 0.8,
+    enable_debug: bool = False
+) -> Tuple[bool, Optional[Dict], float, Dict]:
+    """
+    多显示器图像匹配实现
+    :param screenshots: 屏幕截图列表
+    :param template_path: 模板图片路径
+    :param confidence: 置信度阈值
+    :param enable_debug: 是否启用调试模式
+    :return: (是否找到, 位置信息, 最佳匹配度, 匹配详情)
+    """
+    # 读取模板图片
+    template = cv2.imread(template_path)
+    if template is None:
+        raise ValueError(f"无法读取模板图片: {template_path}")
+    
+    template_height, template_width = template.shape[:2]
+    template_size = (template_width, template_height)
+    
+    best_confidence = 0.0
+    best_location = None
+    best_monitor_id = 1
+    method_results = []
+    monitor_results = []
+    
+    # 定义要尝试的匹配算法
+    match_methods = [
+        (cv2.TM_CCOEFF_NORMED, "TM_CCOEFF_NORMED"),
+        (cv2.TM_CCORR_NORMED, "TM_CCORR_NORMED"),
+        (cv2.TM_SQDIFF_NORMED, "TM_SQDIFF_NORMED")
+    ]
+    
+    for screen in screenshots:
+        screen_img = screen["image"]
+        screen_height, screen_width = screen_img.shape[:2]
+        monitor_id = screen["monitor_id"]
+        
+        # 如果模板比屏幕大，跳过
+        if template_width > screen_width or template_height > screen_height:
+            if enable_debug:
+                monitor_results.append({
+                    "monitor_id": monitor_id,
+                    "best_confidence": 0.0,
+                    "message": "模板尺寸大于屏幕尺寸"
+                })
+            continue
+        
+        monitor_best_confidence = 0.0
+        monitor_best_loc = None
+        monitor_best_method = None
+        
+        for method, method_name in match_methods:
+            try:
+                # 执行模板匹配
+                result = cv2.matchTemplate(screen_img, template, method)
+                
+                # 根据方法类型获取匹配值
+                if method in [cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED]:
+                    # 平方差方法，值越小越好
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                    current_confidence = 1 - min_val  # 转换为相似度（1为最佳）
+                    top_left = min_loc
+                else:
+                    # 其他方法，值越大越好
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                    current_confidence = max_val
+                    top_left = max_loc
+                
+                method_results.append({
+                    "method": method_name,
+                    "confidence": current_confidence,
+                    "monitor_id": monitor_id
+                })
+                
+                # 更新当前显示器的最佳匹配
+                if current_confidence > monitor_best_confidence:
+                    monitor_best_confidence = current_confidence
+                    monitor_best_loc = top_left
+                    monitor_best_method = method_name
+                
+            except Exception as e:
+                if enable_debug:
+                    method_results.append({
+                        "method": method_name,
+                        "confidence": 0.0,
+                        "error": str(e)
+                    })
+        
+        # 更新全局最佳匹配
+        if monitor_best_confidence > best_confidence and monitor_best_confidence > best_confidence:
+            best_confidence = monitor_best_confidence
+            best_monitor_id = monitor_id
+            
+            # 计算中心点坐标（全局坐标）
+            center_x = screen["offset_x"] + monitor_best_loc[0] + template_width // 2
+            center_y = screen["offset_y"] + monitor_best_loc[1] + template_height // 2
+            
+            best_location = {
+                "x": center_x,
+                "y": center_y,
+                "local_x": monitor_best_loc[0],
+                "local_y": monitor_best_loc[1],
+                "width": template_width,
+                "height": template_height,
+                "top_left": (screen["offset_x"] + monitor_best_loc[0], screen["offset_y"] + monitor_best_loc[1]),
+                "monitor_id": monitor_id,
+                "monitor_name": f"显示器 {monitor_id}"
+            }
+        
+        monitor_results.append({
+            "monitor_id": monitor_id,
+            "best_confidence": monitor_best_confidence,
+            "best_method": monitor_best_method
+        })
+    
+    # 确定最终结果
+    found = best_confidence >= confidence
+    
+    match_info = {
+        "template_size": template_size,
+        "methods_tried": method_results,
+        "best_method": next(
+            (m["method"] for m in method_results if m["confidence"] == best_confidence),
+            None
+        ),
+        "monitor_results": monitor_results,
+        "debug": enable_debug
+    }
+    
+    return found, best_location, best_confidence, match_info
+
+# ==============================
 # WebSocket 连接管理
+# ==============================
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
 
     async def connect(self, websocket: WebSocket):
+        """建立WebSocket连接"""
         await websocket.accept()
         self.active_connections.append(websocket)
         await self.send_log(websocket, "info", "WebSocket 连接成功")
 
     def disconnect(self, websocket: WebSocket):
+        """断开WebSocket连接"""
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
 
-    async def send_log(self, websocket: WebSocket, level: str, message: str, data: dict = None):
+    async def send_log(
+        self, 
+        websocket: WebSocket, 
+        level: str, 
+        message: str, 
+        data: Optional[Dict] = None
+    ):
         """发送日志到前端"""
         log_data = {
             "type": "log",
@@ -73,79 +333,64 @@ class ConnectionManager:
         }
         try:
             await websocket.send_json(log_data)
-        except:
+        except Exception:
+            # 忽略发送失败的情况
             pass
 
-manager = ConnectionManager()
+# 初始化WebSocket管理器
+ws_manager = ConnectionManager()
 
-def get_all_monitors():
-    """获取所有显示器信息"""
-    with mss.mss() as sct:
-        monitors = []
-        for i, monitor in enumerate(sct.monitors[1:], 1):  # 跳过第0个（全屏）
-            monitors.append({
-                "id": i,
-                "left": monitor["left"],
-                "top": monitor["top"],
-                "width": monitor["width"],
-                "height": monitor["height"],
-                "name": f"显示器 {i}"
-            })
-        return monitors
+# ==============================
+# PyAutoGUI 初始化配置
+# ==============================
+# 基础安全配置
+pyautogui.FAILSAFE = app_config.PYAUTOGUI_FAILSAFE
+pyautogui.PAUSE = app_config.PYAUTOGUI_PAUSE
 
-def capture_screenshot(monitor_id=None):
-    """
-    截取屏幕
-    monitor_id: None表示所有显示器，数字表示指定显示器
-    返回: 图片或图片列表
-    """
-    with mss.mss() as sct:
-        if monitor_id is None:
-            # 截取所有显示器
-            screenshots = []
-            for i, monitor in enumerate(sct.monitors[1:], 1):
-                screenshot = sct.grab(monitor)
-                img = np.array(screenshot)
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                screenshots.append({
-                    "monitor_id": i,
-                    "image": img,
-                    "offset_x": monitor["left"],
-                    "offset_y": monitor["top"],
-                    "width": monitor["width"],
-                    "height": monitor["height"]
-                })
-            return screenshots
-        else:
-            # 截取指定显示器
-            if monitor_id < 1 or monitor_id >= len(sct.monitors):
-                monitor_id = 1  # 默认主显示器
-            
-            monitor = sct.monitors[monitor_id]
-            screenshot = sct.grab(monitor)
-            img = np.array(screenshot)
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            return [{
-                "monitor_id": monitor_id,
-                "image": img,
-                "offset_x": monitor["left"],
-                "offset_y": monitor["top"],
-                "width": monitor["width"],
-                "height": monitor["height"]
-            }]
+# macOS 特殊配置
+if IS_MACOS:
+    warnings.filterwarnings('ignore', category=DeprecationWarning)
 
-def find_image_on_screen(template_path, confidence=0.8, enable_debug=False, monitor_id=None):
+# ==============================
+# FastAPI 应用初始化
+# ==============================
+app = FastAPI(title="py-picToWork MVP", description="基于图像识别的屏幕自动化操作工具")
+
+# 配置CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==============================
+# 图像识别包装函数
+# ==============================
+def find_image_on_screen(
+    template_path: str,
+    confidence: float = 0.8,
+    enable_debug: bool = False,
+    monitor_id: Optional[int] = None
+) -> Tuple[bool, Optional[Dict], float, Dict]:
     """
     图像识别包装函数 - 支持多尺度、多算法和多显示器匹配
-    monitor_id: None=搜索所有显示器, 数字=指定显示器
-    返回: (found, location, match_confidence, match_info)
+    :param template_path: 模板图片路径
+    :param confidence: 置信度阈值
+    :param enable_debug: 是否启用调试模式
+    :param monitor_id: 监控器ID，None表示所有
+    :return: (是否找到, 位置信息, 匹配置信度, 匹配详情)
     """
     # 截取屏幕（单个或所有显示器）
     screenshots = capture_screenshot(monitor_id)
     
-    # 调用新的图像匹配模块
+    # 调用图像匹配模块
     return find_image_on_screen_multi_monitor(screenshots, template_path, confidence, enable_debug)
 
+# ==============================
+# API 路由
+# ==============================
 @app.get("/api/monitors")
 async def get_monitors():
     """获取所有显示器信息"""
@@ -624,56 +869,61 @@ async def root():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket 端点"""
-    await manager.connect(websocket)
+    await ws_manager.connect(websocket)
     
     try:
         while True:
             # 保持连接
             await asyncio.sleep(1)
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        ws_manager.disconnect(websocket)
 
 @app.post("/api/execute")
 async def execute_task(
     file: UploadFile = File(...),
-    confidence: float = Form(0.8)
+    confidence: float = Form(app_config.DEFAULT_CONFIDENCE)
 ):
     """
     执行识别和点击任务
     """
-    # 获取第一个连接的 WebSocket
-    websocket = manager.active_connections[0] if manager.active_connections else None
-    
-    if not websocket:
+    # 验证WebSocket连接
+    if not ws_manager.active_connections:
         return {"success": False, "error": "No WebSocket connection"}
     
+    websocket = ws_manager.active_connections[0]
+    
     try:
+        # 验证图片文件
+        if not validate_image_file(file.filename, file.content_type):
+            await ws_manager.send_log(websocket, "error", f"❌ 不支持的文件格式: {file.filename}")
+            return {"success": False, "error": "Unsupported file format"}
+        
+        # 验证置信度参数
+        confidence = max(app_config.MIN_CONFIDENCE, min(app_config.MAX_CONFIDENCE, confidence))
+        
         # 保存上传的图片
-        upload_dir = "backend/uploads"
-        os.makedirs(upload_dir, exist_ok=True)
+        file_ext = get_file_extension(file.filename)
+        file_content = await file.read()
+        file_path = save_uploaded_file(file_content, file_ext)
         
-        file_path = os.path.join(upload_dir, f"target_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-        
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
-        
-        await manager.send_log(websocket, "info", f"📁 图片已保存: {file.filename}")
+        await ws_manager.send_log(websocket, "info", f"📁 图片已保存: {file.filename}")
         
         # 获取显示器信息
         monitors = get_all_monitors()
         monitor_summary = ", ".join([f"显示器{m['id']}({m['width']}x{m['height']})" for m in monitors])
-        await manager.send_log(websocket, "info", f"🖥️ 检测到 {len(monitors)} 个显示器: {monitor_summary}")
+        await ws_manager.send_log(websocket, "info", f"🖥️ 检测到 {len(monitors)} 个显示器: {monitor_summary}")
         
-        await manager.send_log(websocket, "info", f"🔍 开始识别屏幕 (置信度: {confidence})")
-        await manager.send_log(websocket, "info", "🔬 使用多算法和多尺度匹配...")
+        await ws_manager.send_log(websocket, "info", f"🔍 开始识别屏幕 (置信度: {confidence})")
+        await ws_manager.send_log(websocket, "info", "🔬 使用多算法和多尺度匹配...")
         
         # 查找图片（启用调试模式）
-        found, location, match_confidence, match_info = find_image_on_screen(file_path, confidence, enable_debug=True)
+        found, location, match_confidence, match_info = find_image_on_screen(
+            file_path, confidence, enable_debug=True
+        )
         
         # 输出详细的坐标信息用于调试
         if found and location:
-            await manager.send_log(
+            await ws_manager.send_log(
                 websocket,
                 "info",
                 f"🔍 坐标详情: 绝对({location.get('x')}, {location.get('y')}), "
@@ -689,14 +939,14 @@ async def execute_task(
                 for m in match_info["methods_tried"] 
                 if 'confidence' in m
             ])
-            await manager.send_log(
+            await ws_manager.send_log(
                 websocket,
                 "info",
                 f"📊 尝试的算法: {methods_text}"
             )
         
         if match_info.get("best_method"):
-            await manager.send_log(
+            await ws_manager.send_log(
                 websocket,
                 "info",
                 f"🎯 最佳匹配方法: {match_info['best_method']}"
@@ -704,7 +954,7 @@ async def execute_task(
         
         if found:
             monitor_info = f"显示器 {location.get('monitor_id', 1)}" if location.get('monitor_id') else ""
-            await manager.send_log(
+            await ws_manager.send_log(
                 websocket, 
                 "success", 
                 f"✅ 找到目标图片！匹配度: {match_confidence:.2%} ({monitor_info})",
@@ -724,7 +974,7 @@ async def execute_task(
                     monitors_summary.append(
                         f"显示器{mr['monitor_id']}: {mr['best_confidence']:.2%}"
                     )
-                await manager.send_log(
+                await ws_manager.send_log(
                     websocket,
                     "info",
                     f"📺 各显示器匹配度: {', '.join(monitors_summary)}"
@@ -735,58 +985,36 @@ async def execute_task(
                 x = location['x']
                 y = location['y']
                 
-                # 获取所有显示器信息用于验证
-                monitors = get_all_monitors()
+                # 验证坐标是否在显示器范围内
+                coordinate_valid, target_monitor = validate_coordinates(x, y, monitors)
                 
-                # 计算所有显示器的总范围
-                all_monitors_info = []
-                for m in monitors:
-                    all_monitors_info.append(
-                        f"显示器{m['id']}[{m['left']},{m['top']}-{m['left']+m['width']},{m['top']+m['height']}]"
+                if coordinate_valid and target_monitor:
+                    await ws_manager.send_log(
+                        websocket,
+                        "info",
+                        f"✅ 坐标在{target_monitor['name']}范围内"
                     )
-                
-                await manager.send_log(
-                    websocket,
-                    "info",
-                    f"📺 显示器范围: {', '.join(all_monitors_info)}"
-                )
-                
-                # 验证坐标是否在任意显示器范围内
-                coordinate_valid = False
-                for m in monitors:
-                    if (m['left'] <= x <= m['left'] + m['width'] and 
-                        m['top'] <= y <= m['top'] + m['height']):
-                        coordinate_valid = True
-                        await manager.send_log(
-                            websocket,
-                            "info",
-                            f"✅ 坐标在显示器{m['id']}范围内"
-                        )
-                        break
-                
-                if not coordinate_valid:
-                    await manager.send_log(
+                else:
+                    await ws_manager.send_log(
                         websocket,
                         "warning",
                         f"⚠️ 坐标({x}, {y})可能超出显示器范围，但仍会尝试点击"
                     )
-                    # 不再直接返回错误，而是继续尝试点击
                 
-                await manager.send_log(
+                await ws_manager.send_log(
                     websocket,
                     "info",
                     f"🖱️ 准备点击坐标: ({x}, {y})"
                 )
                 
                 # 使用更安全的方式移动和点击
-                # 先移动到位置（缓慢移动，避免触发系统手势）
-                pyautogui.moveTo(x, y, duration=0.5, tween=pyautogui.easeInOutQuad)
+                pyautogui.moveTo(x, y, duration=app_config.MOVE_DURATION, tween=pyautogui.easeInOutQuad)
                 await asyncio.sleep(0.3)  # 增加等待时间，确保移动完成
                 
                 # 单独执行点击，不带任何修饰键
-                pyautogui.click(x, y, clicks=1, interval=0.1, button='left')
+                pyautogui.click(x, y, clicks=1, interval=app_config.CLICK_INTERVAL, button='left')
                 
-                await manager.send_log(
+                await ws_manager.send_log(
                     websocket,
                     "success",
                     f"✅ 点击成功！位置: ({x}, {y})"
@@ -801,7 +1029,7 @@ async def execute_task(
                 }
                 
             except Exception as e:
-                await manager.send_log(
+                await ws_manager.send_log(
                     websocket,
                     "error",
                     f"❌ 点击失败: {str(e)}"
@@ -811,7 +1039,7 @@ async def execute_task(
                     "error": f"Click failed: {str(e)}"
                 }
         else:
-            await manager.send_log(
+            await ws_manager.send_log(
                 websocket,
                 "warning",
                 f"⚠️ 未找到目标图片 (最高匹配度: {match_confidence:.2%})"
@@ -825,30 +1053,30 @@ async def execute_task(
             }
             
     except Exception as e:
-        if websocket:
-            await manager.send_log(
-                websocket,
-                "error",
-                f"❌ 执行出错: {str(e)}"
-            )
+        await ws_manager.send_log(
+            websocket,
+            "error",
+            f"❌ 执行出错: {str(e)}"
+        )
         
         return {
             "success": False,
             "error": str(e)
         }
 
+# ==============================
+# 启动入口
+# ==============================
 if __name__ == "__main__":
-    PORT = 8899  # 使用不太常用的端口
-    
     print("=" * 60)
-    print("  py-picToWork 后端服务")
+    print("  py-picToWork 后端服务 (优化版)")
     print("=" * 60)
     print()
-    print(f"📍 服务地址: http://localhost:{PORT}")
-    print(f"📖 API 文档: http://localhost:{PORT}/docs")
+    print(f"📍 服务地址: http://localhost:{app_config.PORT}")
+    print(f"📖 API 文档: http://localhost:{app_config.PORT}/docs")
     print()
     print("✨ 功能说明:")
-    print(f"  1. 打开浏览器访问 http://localhost:{PORT}")
+    print(f"  1. 打开浏览器访问 http://localhost:{app_config.PORT}")
     print("  2. 上传要识别的图片（如按钮截图）")
     print("  3. 调整置信度参数（建议 0.7-0.9）")
     print("  4. 点击'识别并点击'按钮")
@@ -859,23 +1087,13 @@ if __name__ == "__main__":
     print("  - 建议在测试前先截取目标按钮图片")
     print("  - 移动鼠标到屏幕角落可紧急停止")
     print()
-    print(f"💡 提示: 如需更改端口，编辑 main.py 中的 PORT 变量")
+    print(f"💡 提示: 如需更改端口，编辑代码中的 PORT 配置")
     print("=" * 60)
     print()
     
     uvicorn.run(
         app,
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info"
+        host=app_config.HOST,
+        port=app_config.PORT,
+        log_level=app_config.LOG_LEVEL
     )
-
-
-
-
-
-
-
-
-
-
